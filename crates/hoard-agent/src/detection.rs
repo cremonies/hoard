@@ -255,6 +255,9 @@ pub struct DetectionStats {
     pub steam_name_fuzzy: usize,
     pub launcher_exact: usize,
     pub launcher_fuzzy: usize,
+    /// Games listed by other programs in `<config>/libraries/*.json`
+    /// (see [`crate::external_library`]).
+    pub external_slugs: usize,
     pub fs_template_slugs: usize,
     pub registry_slugs: usize,
     pub proton_slugs: usize,
@@ -459,6 +462,14 @@ where
         let (exact, fuzzy) = apply_launcher_name_fallback(catalog, apps, tag, &mut by_slug);
         stats.launcher_exact += exact;
         stats.launcher_fuzzy += fuzzy;
+    }
+
+    // Games other programs know about (a Playnite plugin, an archive manager…):
+    // copied into `C:\Games`, unpacked, or run from a NAS share, so no launcher
+    // has a record of them. Each lists name / folder / exe in a JSON file.
+    if let Some(dir) = crate::external_library::libraries_dir() {
+        let apps = crate::external_library::read_libraries(&dir);
+        stats.external_slugs = apply_external_library(catalog, &apps, &mut by_slug);
     }
 
     // Filesystem heuristic: spawn one blocking task per game, gated by the
@@ -1572,6 +1583,78 @@ const FUZZY_NAME_THRESHOLD: f32 = 0.15;
 /// install_dir attached to matched rows.
 ///
 /// Returns `(exact_added, fuzzy_added)` for the scan stats.
+/// Merges games listed in external library files (see
+/// [`crate::external_library`]). Matched by Steam appid, then executable, then
+/// name; returns how many slugs it added.
+///
+/// A listed folder only becomes `install_dir` when it is local: it's what lets
+/// `<base>`-relative templates find saves kept inside the game folder. A game run
+/// from a network share is still detected (so its saves in AppData / Documents are
+/// looked for and linkable), but the share is never swept for saves.
+fn apply_external_library(
+    catalog: &[LudusaviEntry],
+    apps: &[crate::external_library::ExternalApp],
+    by_slug: &mut HashMap<String, DetectedGame>,
+) -> usize {
+    if apps.is_empty() {
+        return 0;
+    }
+    let catalog_by_slug: HashMap<&str, &LudusaviEntry> =
+        catalog.iter().map(|e| (e.slug.as_str(), e)).collect();
+
+    let mut added = 0usize;
+    for app in apps {
+        let Some((slug, via_fuzzy)) = crate::external_library::resolve_slug(
+            app,
+            |s| catalog_by_slug.contains_key(s),
+            FUZZY_NAME_THRESHOLD,
+        ) else {
+            tracing::debug!(source = %app.source, name = %app.name, "external library: no catalogue match");
+            continue;
+        };
+        let entry = catalog_by_slug[slug.as_str()];
+        match by_slug.get_mut(&entry.slug) {
+            Some(existing) => {
+                if existing.install_dir.is_none() {
+                    existing.install_dir = app.install_dir.clone();
+                }
+            }
+            None => {
+                by_slug.insert(
+                    entry.slug.clone(),
+                    DetectedGame {
+                        slug: entry.slug.clone(),
+                        display_name: entry.display_name.clone(),
+                        found_paths: Vec::new(),
+                        path_confidences: Vec::new(),
+                        path_reasons: Vec::new(),
+                        confidence: if via_fuzzy {
+                            Confidence::Low
+                        } else {
+                            Confidence::Medium
+                        },
+                        source: DetectionSource::SteamLibrary,
+                        steam_app_id: app.steam_app_id.or(entry.steam_app_id),
+                        install_dir: app.install_dir.clone(),
+                        needs_folder: false,
+                        steam_cloud: false,
+                    },
+                );
+                added += 1;
+            }
+        }
+        tracing::info!(
+            source = %app.source,
+            name = %app.name,
+            slug = %entry.slug,
+            fuzzy = via_fuzzy,
+            local_install = app.install_dir.is_some(),
+            "external library → catalog match"
+        );
+    }
+    added
+}
+
 fn apply_launcher_name_fallback(
     catalog: &[LudusaviEntry],
     apps: &[LauncherApp],
